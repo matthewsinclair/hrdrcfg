@@ -7,7 +7,7 @@ setopt no_unset pipe_fail
 
 HERE=${0:A:h}
 HRDRCFG=$HERE:h/bin/hrdrcfg
-TMP=$(mktemp -d)
+TMP=${$(mktemp -d):A}
 trap 'rm -rf $TMP' EXIT
 
 passed=0 failed=0
@@ -123,6 +123,84 @@ mkdir -p $INIT
 check "init: starter names the space after the folder" "fresh" "$(cd $INIT && $HRDRCFG show | awk '$1 == "space" {print $2}')"
 
 check "--version reads VERSION" "hrdrcfg $(<$HERE:h/VERSION)" "$($HRDRCFG --version)"
+
+# --- 0.2.0: spaces/ files, a folder per tab, another machine, discover -----------
+
+# A stand-in hc: `get` answers a terminal's cwd from $STUB_CWDS; `exec` is the remote home.
+HCSTUB=$TMP/hc
+cat >$HCSTUB <<'EOF'
+#!/usr/bin/env zsh
+case $1 in
+  get)  jq -cn --arg a $2 --arg c "$(jq -r --arg a $2 '.[$a] // empty' $STUB_CWDS)" '{address: $a, cwd: $c}' ;;
+  exec) print -n /home/u ;;
+esac
+EOF
+chmod +x $HCSTUB
+export HRDRCFG_HC=$HCSTUB STUB_CWDS=$TMP/cwds.json HRDRCFG_SPACES=$TMP/spaces
+print '{}' >$STUB_CWDS
+mkdir -p $HRDRCFG_SPACES
+
+# A space that is not a project, on another machine, with a folder for one tab.
+cat >$HRDRCFG_SPACES/box.hrdrcfg <<'EOF'
+space: me@box
+machine: box
+folder: ~/agt
+roles_cmd: ""
+tabs:
+  - name: box-sysadm
+    folder: box-sysadm
+  - term
+EOF
+no_spaces; reset
+$HRDRCFG up me@box >/dev/null
+check "up: a spaces/ file is found by its space name" "me@box" "$(jq -r 'select(.[0] == "space.new") | .[index("--name") + 1]' $STUB_LOG)"
+check "up: a remote space lives on its machine" "box" "$(jq -r 'select(.[0] == "space.new") | .[index("--machine") + 1]' $STUB_LOG)"
+check "up: a tab's folder, under the machine's home" "/home/u/agt/box-sysadm" \
+  "$(jq -r 'select(.[0] == "space.new") | .[index("--folder") + 1]' $STUB_LOG)"
+check "up: a tab without one starts in the space's folder" "/home/u/agt" \
+  "$(jq -r 'select(.[0] == "tab.new") | .[index("--folder") + 1]' $STUB_LOG)"
+check "up: roles_cmd \"\" in a spaces/ file means no role tabs" "box-sysadm term" \
+  "$($HRDRCFG show me@box | awk '$1 == "tab" {printf "%s%s", sep, $2; sep = " "}')"
+check "ls: lists spaces/ files beside projects" "closed me@box" "$($HRDRCFG ls | awk '$2 == "me@box" {print $1, $2}')"
+
+# discover on a project: an extra tab open, a configured one closed.
+cat >$PROJ/.hrdrcfg/$USER.hrdrcfg <<'EOF'
+tabs:
+  - sh
+  - name: outs
+    run: intent expl outs
+EOF
+mkdir -p $PROJ/sub
+jq -n '{spaces: [{id: "sp-demo", name: "devel/demo", tabs: [
+  {name: "vc", terminals: [{terminal: "t1", app: null}]},
+  {name: "review", terminals: [{terminal: "t2", app: "claude-code"}]},
+  {name: "sh", terminals: [{terminal: "t3", app: null}]}]}]}' >$STUB_LS
+jq -n --arg r $PROJ --arg s $PROJ/sub '{t1: $r, t2: $s, t3: $r}' >$STUB_CWDS
+before=$(<$PROJ/.hrdrcfg/$USER.hrdrcfg)
+(cd $PROJ && $HRDRCFG discover --dry-run >$TMP/dry.out)
+check "discover --dry-run writes nothing" "$before" "$(<$PROJ/.hrdrcfg/$USER.hrdrcfg)"
+check "discover --dry-run reports the extra tab" "1" "$(grep -c '+ tab review' $TMP/dry.out)"
+check "discover --dry-run reports the closed tab" "1" "$(grep -c -- '- tab outs' $TMP/dry.out)"
+check "discover: a closed role is reported, not written" "1" "$(grep -c 'role dc not open' $TMP/dry.out)"
+(cd $PROJ && $HRDRCFG discover --yes >/dev/null)
+check "discover --yes: tabs follow Herdr, roles left out" "review sh" "$(yq -r '.tabs[].name' $PROJ/.hrdrcfg/$USER.hrdrcfg | paste -sd ' ' -)"
+check "discover: a new tab keeps its own folder" "$PROJ/sub" "$(yq -r '.tabs[] | select(.name == "review") | .folder' $PROJ/.hrdrcfg/$USER.hrdrcfg)"
+check "discover: it wrote the user's file, not dft" "space: devel/demo" "$(grep -v '^#' $PROJ/.hrdrcfg/dft.hrdrcfg)"
+
+# discover --all: an open space no config describes gets a spaces/ file.
+jq -n '{spaces: [{id: "sp-l", name: "loose", machine: null, tabs: [
+  {name: "agent", terminals: [{terminal: "t8", app: "claude-code"}]},
+  {name: "term", terminals: [{terminal: "t9", app: null}]}]}]}' >$STUB_LS
+jq -n --arg a $HOME/agt/agent --arg t $HOME '{t8: $a, t9: $t}' >$STUB_CWDS
+$HRDRCFG discover --all --yes >/dev/null
+f=$HRDRCFG_SPACES/loose.hrdrcfg
+check "discover --all: writes a spaces/ file for an unconfigured space" "loose" "$(yq -r .space $f 2>/dev/null)"
+check "discover --all: its folder is the first tab's, as ~" "~/agt/agent" "$(yq -r .folder $f)"
+check "discover --all: tabs in Herdr's order, folders where they differ" "agent: term:~" \
+  "$(yq -r '.tabs[] | .name + ":" + (.folder // "")' $f | paste -sd ' ' -)"
+no_spaces; reset
+$HRDRCFG up loose >/dev/null
+check "up: a discovered space builds again" "agent term" "$(jq -r 'select(.[0] | test("space.new|tab.new")) | if .[0] == "space.new" then .[index("--tab") + 1] else .[index("--name") + 1] end' $STUB_LOG | paste -sd ' ' -)"
 
 print -r -- "$passed passed, $failed failed"
 (( failed == 0 ))
