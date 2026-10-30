@@ -8,6 +8,7 @@ $ hrdrcfg up            # build the space, or show it if it is already open
 $ hrdrcfg down          # close it (asks first if an agent is running in it)
 $ hrdrcfg show          # print the space and tabs it would build; change nothing
 $ hrdrcfg ls            # every configured space, open or closed
+$ hrdrcfg sort          # put the open spaces in their configured order
 $ hrdrcfg discover      # compare what Herdr runs with the config; offer each change
 $ hrdrcfg init          # write a starter .hrdrcfg/dft.hrdrcfg
 $ hrdrcfg up matts@box  # a space that is not a project, by name
@@ -33,6 +34,7 @@ Keys:
 
 - `space`: the Herdr space name. Default: the project folder's name, lowercased.
 - `machine`: the Herdr machine the space lives on (`hc machine ls`). Default: this one.
+- `order`: a whole number, the space's place in Herdr's list of spaces. Lowest first, then spaces with no order, as Herdr has them. `up` puts a new space in its place, and `sort` puts every open space in its place. Herdr keeps each machine's spaces together, this one's first, so the order applies within each machine.
 - `folder`: a `spaces/` file's root folder. Default: `~`. A project's root is its own folder.
 - `roles_cmd`: a shell command, run in the root, that prints one role per line. Each role becomes a tab of that name, before `tabs`. `""` for none. hrdrcfg does not know or care where roles come from.
 - `roles_order`: roles to put first, in this order; any others follow in the order printed.

@@ -29,6 +29,7 @@ Usage:
   hrdrcfg down [target] [--yes]   close it (asks first when an agent runs in it)
   hrdrcfg show [target]           print the resolved space and tabs; change nothing
   hrdrcfg ls                      every configured space, open or closed
+  hrdrcfg sort                    put open spaces in their configured order
   hrdrcfg discover [target] [--all] [--dry-run] [--yes] [--to user|dft]
                                   compare what Herdr runs with the config, and
                                   offer each change; --all walks every open space
@@ -50,6 +51,8 @@ Config, each layer over the one before, lists replaced whole:
 Keys:
   space        Herdr space name; default: the project folder's name, lowercased
   machine      Herdr machine the space lives on (hc machine ls); default: this one
+  order        where the space sits in Herdr's list: lowest first, then spaces
+               with no order; set on `up` and by `sort`
   folder       a spaces/ file's root folder; default: ~ (a project's is its folder)
   roles_cmd    shell command run in the root; prints one role per line, each
                becoming a tab of that name; "" for none
@@ -293,6 +296,50 @@ cmd_up() {
     herdr_do tab.new $args >/dev/null
   done
   print -r -- "opened $name: ${(j: :)${(f)"$(print -l $tabs | jq -r .name)"}}"
+  sort_spaces
+}
+
+# Every configured space that sets an order, as a JSON object: {"<space>": <order>}.
+space_orders() {
+  local item cfg o
+  for item in ${(f)"$(all_targets)"}; do
+    load_listed $item
+    cfg=$(config_json)
+    o=$(jq -r '.order // empty' <<<$cfg)
+    [[ -z $o ]] && continue
+    [[ $o == (-|)<-> ]] || die "$(space_name $cfg): order is $o, not a whole number"
+    jq -cn --arg n "$(space_name $cfg)" --argjson o $o '{($n): $o}'
+  done | jq -sc 'add // {}'
+}
+
+# Put each machine's open spaces in order: those with an order first, lowest
+# first (ties keep Herdr's order), then the rest as Herdr has them. Herdr keeps
+# each machine's spaces together, so each machine is sorted on its own.
+sort_spaces() {
+  local orders block id
+  local -a cur want
+  local -i i j
+  orders=$(space_orders)
+  for block in ${(f)"$($HERDR ls | jq -c --argjson o $orders '
+      .spaces | to_entries | map(.value + {pos: .key}) | group_by(.machine // "")[] |
+      {cur: map(.id),
+       want: ((map(select($o[.name] != null)) | sort_by($o[.name], .pos)) + map(select($o[.name] == null)) | map(.id))}')"}; do
+    cur=(${(f)"$(jq -r '.cur[]' <<<$block)"})
+    want=(${(f)"$(jq -r '.want[]' <<<$block)"})
+    for (( i = 1; i <= $#want; i++ )); do
+      id=$want[i]
+      [[ $cur[i] == $id ]] && continue
+      herdr_do space.move --id $id --index $i >/dev/null
+      j=$cur[(Ie)$id]
+      cur[j]=()
+      cur[i,i-1]=($id)
+      print -r -- "moved  $($HERDR ls | jq -r --arg id $id 'first(.spaces[] | select(.id == $id) | .name) // $id') to $i"
+    done
+  done
+}
+
+cmd_sort() {
+  sort_spaces
 }
 
 cmd_down() {
@@ -589,6 +636,7 @@ case ${1:-} in
   show)      shift; cmd_show "$@" ;;
   ls)        shift; cmd_ls "$@" ;;
   discover)  shift; cmd_discover "$@" ;;
+  sort)      shift; cmd_sort "$@" ;;
   init)      shift; cmd_init "$@" ;;
   --version) print -r -- "hrdrcfg $(<$HRDRCFG_HOME/VERSION)" ;;
   --help|-h) usage ;;

@@ -33,6 +33,8 @@ esac
 EOF
 chmod +x $STUB
 export HRDRCFG_HERDR=$STUB STUB_LOG=$TMP/calls STUB_LS=$TMP/ls.json
+# Never the real ~/.config/hrdrcfg/spaces.
+export HRDRCFG_SPACES=$TMP/spaces
 
 # A project, the user's config, and one user's override.
 PROJ=$TMP/prj/Demo
@@ -136,7 +138,7 @@ case $1 in
 esac
 EOF
 chmod +x $HCSTUB
-export HRDRCFG_HC=$HCSTUB STUB_CWDS=$TMP/cwds.json HRDRCFG_SPACES=$TMP/spaces
+export HRDRCFG_HC=$HCSTUB STUB_CWDS=$TMP/cwds.json
 print '{}' >$STUB_CWDS
 mkdir -p $HRDRCFG_SPACES
 
@@ -201,6 +203,39 @@ check "discover --all: tabs in Herdr's order, folders where they differ" "agent:
 no_spaces; reset
 $HRDRCFG up loose >/dev/null
 check "up: a discovered space builds again" "agent term" "$(jq -r 'select(.[0] | test("space.new|tab.new")) | if .[0] == "space.new" then .[index("--tab") + 1] else .[index("--name") + 1] end' $STUB_LOG | paste -sd ' ' -)"
+
+# --- 0.3.0: order -----------------------------------------------------------------
+
+# Three ordered spaces (one on another machine), and two without an order.
+for s in first:1 second:2 third:3; do
+  print -r -- "space: ${s%%:*}"$'\n'"order: ${s##*:}"$'\n'"tabs: [sh]" >$HRDRCFG_SPACES/${s%%:*}.hrdrcfg
+done
+print -r -- $'space: far\nmachine: box\norder: 1\ntabs: [sh]' >$HRDRCFG_SPACES/far.hrdrcfg
+jq -n '{spaces: [
+  {id: "sp-l", name: "loose", machine: null, tabs: []},
+  {id: "sp-3", name: "third", machine: null, tabs: []},
+  {id: "sp-d", name: "devel/demo", machine: null, tabs: []},
+  {id: "sp-1", name: "first", machine: null, tabs: []},
+  {id: "sp-2", name: "second", machine: null, tabs: []},
+  {id: "box/sp-b", name: "me@box", machine: "box", tabs: []},
+  {id: "box/sp-f", name: "far", machine: "box", tabs: []}]}' >$STUB_LS
+reset
+$HRDRCFG sort >/dev/null
+# Replay the moves on the list as Herdr would (index counts from 1), each inside its machine's block.
+got=$(jq -rn --slurpfile ls $STUB_LS --slurpfile moves $STUB_LOG '
+  def move($id; $i): (map(select(. != $id))) as $r | $r[:$i - 1] + [$id] + $r[$i - 1:];
+  $ls[0].spaces | group_by(.machine // "") | map(map(.id)) as $blocks |
+  reduce ($moves[] | {id: .[index("--id") + 1], i: (.[index("--index") + 1] | tonumber)}) as $m
+    ($blocks; map(if index($m.id) then move($m.id; $m.i) else . end)) | flatten | join(" ")')
+check "sort: ordered spaces first, lowest first, the rest kept in Herdr's order" \
+  "sp-1 sp-2 sp-3 sp-l sp-d box/sp-f box/sp-b" "$got"
+reset
+jq -n '{spaces: [{id: "sp-1", name: "first", machine: null, tabs: []}, {id: "sp-l", name: "loose", machine: null, tabs: []}]}' >$STUB_LS
+$HRDRCFG sort >/dev/null
+check "sort: an ordered list is left alone" "" "$(calls)"
+print -r -- $'space: bad\norder: soon\ntabs: [sh]' >$HRDRCFG_SPACES/bad.hrdrcfg
+check "sort: an order that is not a number is refused" "hrdrcfg: bad: order is soon, not a whole number" "$($HRDRCFG sort 2>&1)"
+rm $HRDRCFG_SPACES/bad.hrdrcfg
 
 print -r -- "$passed passed, $failed failed"
 (( failed == 0 ))
