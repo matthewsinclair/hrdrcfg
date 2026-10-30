@@ -1,0 +1,265 @@
+#!/usr/bin/env zsh
+# hrdrcfg -- open a project's Herdr space from the project's own config.
+#
+# A project holds .hrdrcfg/dft.hrdrcfg (its defaults) and, optionally,
+# .hrdrcfg/<user>.hrdrcfg (one user's overrides). Both lie over the user's
+# own config, ~/.config/hrdrcfg/config.yaml. hrdrcfg knows nothing about
+# where roles come from: roles_cmd prints them, one per line.
+
+emulate -R zsh
+setopt err_return no_unset pipe_fail extended_glob
+
+HRDRCFG_HOME=${0:A:h:h}
+HERDR=${HRDRCFG_HERDR:-herdr-app}
+HC=${HRDRCFG_HC:-hc}
+USER_CONFIG=${HRDRCFG_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/hrdrcfg/config.yaml}
+CFG_DIR=.hrdrcfg
+
+die() { print -ru2 -- "hrdrcfg: $*"; exit 1; }
+
+usage() {
+  cat <<'EOF'
+hrdrcfg -- open a project's Herdr space from the project's own config
+
+Usage:
+  hrdrcfg up [dir]            open the project's space, or show it if open
+  hrdrcfg down [dir] [--yes]  close it (asks first when an agent runs in it)
+  hrdrcfg show [dir]          print the resolved space and tabs; change nothing
+  hrdrcfg ls                  projects under the configured roots, open or not
+  hrdrcfg init [dir]          write a starter .hrdrcfg/dft.hrdrcfg
+  hrdrcfg --version | --help
+
+[dir] defaults to the nearest folder at or above this one holding .hrdrcfg/.
+
+Config, each layer over the one before, lists replaced whole:
+  ~/.config/hrdrcfg/config.yaml   the user's defaults (HRDRCFG_CONFIG)
+  <project>/.hrdrcfg/dft.hrdrcfg  the project's
+  <project>/.hrdrcfg/$USER.hrdrcfg one user's overrides
+
+Keys:
+  space        Herdr space name; default: the project folder's name, lowercased
+  machine      Herdr machine the space lives on (hc machine ls); default: this one
+  roles_cmd    shell command run in the project root; prints one role per line,
+               each becoming a tab of that name
+  roles_order  roles to put first, in this order; others follow as printed
+  tabs         tabs after the roles: a name, or {name, run}; run is a command
+               line (split as the shell does, no pipes) or a list of words
+  roots        folders `ls` searches: each one and its children with .hrdrcfg/
+EOF
+}
+
+# The resolved config for a project root (or for none: the user's alone), as JSON.
+config_json() {
+  local root=${1:-} f
+  local -a files
+  [[ -f $USER_CONFIG ]] && files+=$USER_CONFIG
+  if [[ -n $root ]]; then
+    for f in $root/$CFG_DIR/dft.hrdrcfg $root/$CFG_DIR/$USER.hrdrcfg; do
+      [[ -f $f ]] && files+=$f
+    done
+  fi
+  if (( ! $#files )); then
+    print -r -- '{}'
+    return
+  fi
+  yq eval-all -o=json '. as $layer ireduce ({}; . * $layer)' $files
+}
+
+# The project root: the given folder, else the nearest at or above $PWD with .hrdrcfg/.
+find_root() {
+  local dir=${1:-}
+  if [[ -n $dir ]]; then
+    [[ -d $dir/$CFG_DIR ]] || die "no $CFG_DIR/ in $dir"
+    print -r -- ${dir:A}
+    return
+  fi
+  dir=$PWD
+  while [[ $dir != / ]]; do
+    [[ -d $dir/$CFG_DIR ]] && { print -r -- $dir; return; }
+    dir=${dir:h}
+  done
+  die "no $CFG_DIR/ here or above $PWD (hrdrcfg init makes one)"
+}
+
+expand_home() { print -r -- ${1/#\~/$HOME}; }
+
+# Words as a JSON array; built here, as jq --args reads a leading - as its own option.
+json_words() { (( $# )) || { print -r -- '[]'; return; }; print -rl -- "$@" | jq -R . | jq -sc .; }
+
+space_name() {
+  local root=$1 cfg=$2 name
+  name=$(jq -r '.space // empty' <<<$cfg)
+  print -r -- ${name:-${(L)root:t}}
+}
+
+# Tabs, one JSON object per line: {"name":..., "argv":[...]} (argv absent for a shell).
+tabs_jsonl() {
+  local root=$1 cfg=$2 cmd role
+  local -a printed order roles
+  cmd=$(jq -r '.roles_cmd // empty' <<<$cfg)
+  if [[ -n $cmd ]]; then
+    printed=(${(f)"$(cd $root && zsh -c $cmd)"}) || die "roles_cmd failed in $root: $cmd"
+    printed=(${printed//[[:space:]]/})
+    printed=(${printed:#})
+    order=(${(f)"$(jq -r '.roles_order // [] | .[]' <<<$cfg)"})
+    for role in $order; do
+      (( ${printed[(Ie)$role]} )) && roles+=$role
+    done
+    for role in $printed; do
+      (( ${roles[(Ie)$role]} )) || roles+=$role
+    done
+    for role in $roles; do
+      jq -cn --arg n $role '{name: $n}'
+    done
+  fi
+  jq -c '.tabs // [] | .[] | if type == "string" then {name: .} else . end' <<<$cfg |
+    while IFS= read -r tab; do
+      local run_type=$(jq -r '.run | type' <<<$tab)
+      case $run_type in
+        null)   jq -c '{name}' <<<$tab ;;
+        array)  jq -c '{name, argv: .run}' <<<$tab ;;
+        string)
+          local line=$(jq -r .run <<<$tab)
+          local -a words=(${(Q)${(z)line}})
+          jq -c --argjson argv "$(json_words $words)" '{name, argv: $argv}' <<<$tab ;;
+        *) die "tab $(jq -r .name <<<$tab): run is a $run_type, not a command line or a list" ;;
+      esac
+    done
+}
+
+# The folder the space's terminals start in, on its machine.
+space_folder() {
+  local root=$1 machine=$2 remote_home
+  if [[ -z $machine ]]; then
+    print -r -- $root
+    return
+  fi
+  [[ $root == $HOME/* ]] || die "$root is not under $HOME, so it has no place on $machine"
+  remote_home=$($HC exec --on $machine sh -c 'printf %s "$HOME"') || die "cannot reach $machine"
+  print -r -- $remote_home/${root#$HOME/}
+}
+
+# herdr-app do, stopping with its error rather than carrying on half-built.
+herdr_do() {
+  local out
+  if ! out=$($HERDR do "$@" 2>&1); then
+    die "herdr-app do $1: $(jq -r '.error // .' <<<$out 2>/dev/null || print -r -- $out)"
+  fi
+  print -r -- $out
+}
+
+# The open space's JSON from herdr-app ls, or nothing.
+open_space() {
+  $HERDR ls | jq -c --arg n $1 'first(.spaces[] | select(.name == $n)) // empty'
+}
+
+cmd_show() {
+  local root cfg
+  root=$(find_root "$@")
+  cfg=$(config_json $root)
+  print -r -- "space    $(space_name $root $cfg)"
+  print -r -- "machine  $(jq -r '.machine // "this one"' <<<$cfg)"
+  print -r -- "folder   $root"
+  tabs_jsonl $root $cfg | jq -r '"tab      \(.name)" + (if .argv then "  runs \(.argv | join(" "))" else "" end)'
+}
+
+cmd_up() {
+  local root cfg name machine folder space tab
+  local -a tabs args
+  root=$(find_root "$@")
+  cfg=$(config_json $root)
+  name=$(space_name $root $cfg)
+  space=$(open_space $name)
+  if [[ -n $space ]]; then
+    herdr_do space.select --id $(jq -r .id <<<$space) >/dev/null
+    print -r -- "shown  $name (already open)"
+    return
+  fi
+  tabs=(${(f)"$(tabs_jsonl $root $cfg)"})
+  (( $#tabs )) || die "$name has no tabs: set roles_cmd or tabs"
+  machine=$(jq -r '.machine // empty' <<<$cfg)
+  folder=$(space_folder $root "$machine")
+
+  args=(--name $name --folder $folder --tab $(jq -r .name <<<$tabs[1]))
+  [[ -n $machine ]] && args+=(--machine $machine)
+  [[ $(jq 'has("argv")' <<<$tabs[1]) == true ]] && args+=(--argv $(jq -c .argv <<<$tabs[1]))
+  space=$(herdr_do space.new $args | jq -r .space)
+
+  for tab in $tabs[2,-1]; do
+    args=(--space $space --name $(jq -r .name <<<$tab) --folder $folder)
+    [[ $(jq 'has("argv")' <<<$tab) == true ]] && args+=(--argv $(jq -c .argv <<<$tab))
+    herdr_do tab.new $args >/dev/null
+  done
+  print -r -- "opened $name: ${(j: :)${(f)"$(print -l $tabs | jq -r .name)"}}"
+}
+
+cmd_down() {
+  local yes=0 root cfg name space agents
+  local -a rest
+  for arg in "$@"; do
+    case $arg in
+      --yes|-y) yes=1 ;;
+      *) rest+=$arg ;;
+    esac
+  done
+  root=$(find_root $rest)
+  cfg=$(config_json $root)
+  name=$(space_name $root $cfg)
+  space=$(open_space $name)
+  [[ -n $space ]] || { print -r -- "closed $name (was not open)"; return; }
+  agents=$(jq -r '[.tabs[] | .name as $t | .terminals[] | select(.app != null) | "\($t): \(.app)"] | join(", ")' <<<$space)
+  if [[ -n $agents && $yes == 0 ]]; then
+    [[ -t 0 ]] || die "$name has agents running ($agents); pass --yes to close it anyway"
+    read -q "?$name has agents running ($agents). Close it? [y/N] " || { print; die "left $name open"; }
+    print
+  fi
+  herdr_do space.close --id $(jq -r .id <<<$space) --confirmed true >/dev/null
+  print -r -- "closed $name"
+}
+
+cmd_ls() {
+  local cfg root dir name state
+  local -a roots open found
+  cfg=$(config_json)
+  roots=(${(f)"$(jq -r '.roots // [] | .[]' <<<$cfg)"})
+  (( $#roots )) || die "no roots in $USER_CONFIG to search"
+  open=(${(f)"$($HERDR ls | jq -r '.spaces[].name')"})
+  for root in $roots; do
+    root=$(expand_home $root)
+    for dir in $root(N/) $root/*(N/); do
+      [[ -d $dir/$CFG_DIR ]] || continue
+      (( ${found[(Ie)$dir]} )) && continue
+      found+=$dir
+      name=$(space_name $dir "$(config_json $dir)")
+      state=closed
+      (( ${open[(Ie)$name]} )) && state=open
+      printf '%-7s %-36s %s\n' $state $name ${dir/#$HOME/\~}
+    done
+  done
+}
+
+cmd_init() {
+  local dir=${1:-$PWD} f
+  f=$dir/$CFG_DIR/dft.hrdrcfg
+  [[ -e $f ]] && die "$f exists"
+  mkdir -p $dir/$CFG_DIR
+  cat >$f <<EOF
+# hrdrcfg: this project's Herdr space (see hrdrcfg --help)
+space: ${(L)dir:A:t}
+tabs:
+  - sh
+EOF
+  print -r -- "wrote ${f/#$HOME/~}"
+}
+
+case ${1:-} in
+  up)        shift; cmd_up "$@" ;;
+  down)      shift; cmd_down "$@" ;;
+  show)      shift; cmd_show "$@" ;;
+  ls)        shift; cmd_ls "$@" ;;
+  init)      shift; cmd_init "$@" ;;
+  --version) print -r -- "hrdrcfg $(<$HRDRCFG_HOME/VERSION)" ;;
+  --help|-h) usage ;;
+  '')        usage; exit 2 ;;
+  *)         print -ru2 -- "hrdrcfg: unknown command: $1"; usage >&2; exit 2 ;;
+esac
